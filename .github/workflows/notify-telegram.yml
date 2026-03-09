@@ -25,11 +25,12 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TOPIC_ID: ${{ inputs.topic_id }}
-          EVENT_PATH: ${{ github.event_path }}
           EVENT_NAME: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
+
+          EVENT_PATH="${GITHUB_EVENT_PATH:-}"
 
           escape_html() {
             local text="$1"
