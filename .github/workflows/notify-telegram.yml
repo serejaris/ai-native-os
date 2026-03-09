@@ -1,0 +1,160 @@
+name: Reusable Telegram GitHub notifier
+
+on:
+  workflow_call:
+    inputs:
+      topic_id:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      TELEGRAM_BOT_TOKEN:
+        required: true
+      TELEGRAM_CHAT_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build and send telegram payload
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TOPIC_ID: ${{ inputs.topic_id }}
+          EVENT_PATH: ${{ github.event_path }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          escape_html() {
+            local text="$1"
+            text="${text//#/}"
+            jq -R -s -r @html <<< "$text"
+          }
+
+          action="$(jq -r '.action // "unknown"' "$EVENT_PATH")"
+          repo_full="$(jq -r '.repository.full_name // "unknown/repo"' "$EVENT_PATH")"
+          repo_short="${repo_full#*/}"
+
+          case "${EVENT_NAME}" in
+            issues)
+              number="$(jq -r '.issue.number // 0' "$EVENT_PATH")"
+              title="$(jq -r '.issue.title // ""' "$EVENT_PATH")"
+              body="$(jq -r '.issue.body // ""' "$EVENT_PATH")"
+              url="$(jq -r '.issue.html_url // ""' "$EVENT_PATH")"
+              labels="$(jq -r '[.issue.labels // [] | .[]?.name] | join(", ")' "$EVENT_PATH")"
+              case "$action" in
+                opened) emoji="🆕" ; header="Issue #${number} opened" ;;
+                closed) emoji="✅" ; header="Issue #${number} closed" ;;
+                reopened) emoji="🔄" ; header="Issue #${number} reopened" ;;
+                *) echo "Skipping issue action=${action}" ; exit 0 ;;
+              esac
+              ;;
+            pull_request)
+              number="$(jq -r '.pull_request.number // 0' "$EVENT_PATH")"
+              title="$(jq -r '.pull_request.title // ""' "$EVENT_PATH")"
+              body="$(jq -r '.pull_request.body // ""' "$EVENT_PATH")"
+              url="$(jq -r '.pull_request.html_url // ""' "$EVENT_PATH")"
+              labels="$(jq -r '[.pull_request.labels // [] | .[]?.name] | join(", ")' "$EVENT_PATH")"
+              merged="$(jq -r '.pull_request.merged // false' "$EVENT_PATH")"
+              base="$(jq -r '.pull_request.base.ref // ""' "$EVENT_PATH")"
+              head="$(jq -r '.pull_request.head.ref // ""' "$EVENT_PATH")"
+              additions="$(jq -r '.pull_request.additions // 0' "$EVENT_PATH")"
+              deletions="$(jq -r '.pull_request.deletions // 0' "$EVENT_PATH")"
+              case "$action" in
+                opened) emoji="🔀" ; header="PR #${number} opened" ;;
+                ready_for_review) emoji="👀" ; header="PR #${number} ready for review" ;;
+                closed)
+                  if [[ "$merged" == "true" ]]; then
+                    emoji="🟣"
+                    header="PR #${number} merged"
+                  else
+                    emoji="❌"
+                    header="PR #${number} closed"
+                  fi
+                  ;;
+                *) echo "Skipping pull_request action=${action}" ; exit 0 ;;
+              esac
+              ;;
+            *)
+              echo "Unsupported event ${EVENT_NAME}"
+              exit 0
+              ;;
+          esac
+
+          safe_title="$(escape_html "$title")"
+          safe_body="$(echo "$body" | tr '\r' ' ' | tr '\n' ' ' | cut -c 1-150)"
+          safe_body="${safe_body//#/}"
+          safe_body="$(escape_html "$safe_body")"
+
+          message="${emoji} <b>${header}</b>"
+          message+=$'\n'"<a href=\"${url}\">${safe_title}</a>"
+          message+=$'\n'
+          message+=$'\n'"📂 <code>${repo_short}</code>"
+
+          if [[ -n "$safe_body" ]]; then
+            message+=$'\n'"📝 <i>${safe_body}</i>"
+          fi
+
+          if [[ -n "$labels" && "$labels" != "null" ]]; then
+            safe_labels="$(escape_html "$labels")"
+            message+=$'\n'"🏷 <i>${safe_labels}</i>"
+          fi
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -n "$base" && -n "$head" ]]; then
+              message+=$'\n'"🎯 <code>${base}</code> ← <code>${head}</code>"
+            fi
+            message+=$'\n'"📊 <code>+${additions} −${deletions}</code>"
+          fi
+
+          if [[ -n "$TOPIC_ID" ]]; then
+            if [[ ! "$TOPIC_ID" =~ ^[0-9]+$ ]]; then
+              echo "TOPIC_ID must be numeric when provided"
+              exit 1
+            fi
+            payload="$(jq -nc \
+              --arg chat_id "$CHAT_ID" \
+              --argjson topic_id "$TOPIC_ID" \
+              --arg text "$message" \
+              '{chat_id:$chat_id, message_thread_id:$topic_id, text:$text, parse_mode:"HTML", disable_web_page_preview:true}')"
+          else
+            payload="$(jq -nc \
+              --arg chat_id "$CHAT_ID" \
+              --arg text "$message" \
+              '{chat_id:$chat_id, text:$text, parse_mode:"HTML", disable_web_page_preview:true}')"
+          fi
+
+          send() {
+            curl -s -X POST \
+              "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$1"
+          }
+
+          response="$(send "$payload")"
+          ok="$(jq -r '.ok // false' <<< "$response")"
+          if [[ "$ok" == "true" ]]; then
+            echo "Message sent"
+            exit 0
+          fi
+
+          error_code="$(jq -r '.error_code // empty' <<< "$response")"
+          if [[ "$error_code" == "429" ]]; then
+            retry_after="$(jq -r '.parameters.retry_after // 1' <<< "$response")"
+            sleep "$retry_after"
+            response="$(send "$payload")"
+            ok="$(jq -r '.ok // false' <<< "$response")"
+            if [[ "$ok" == "true" ]]; then
+              echo "Message sent after retry"
+              exit 0
+            fi
+          fi
+
+          echo "Telegram API error: $(jq -c . <<< "$response")"
+          exit 1
